@@ -7,6 +7,10 @@ edition = "2021"
 name = "fnn"
 path = "src/main.rs"
 
+[[bin]]
+name = "x402-facilitator"
+path = "src/x402_facilitator.rs"
+
 [features]
 default = ["fnn/rocksdb"]
 metrics = ["fnn/metrics"]
@@ -32,3 +36,9 @@ tokio = { version = "1", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hyper = { version = "1.5", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

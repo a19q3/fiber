@@ -2251,11 +2251,17 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 name = "fiber-bin"
 version = "0.8.0"
 dependencies = [
+ "anyhow",
  "ckb-chain-spec",
  "ckb-resource",
  "fnn",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
  "jsonrpsee",
  "ractor",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
