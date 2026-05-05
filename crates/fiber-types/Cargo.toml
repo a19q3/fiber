@@ -2,6 +2,7 @@
 name = "fiber-types"
 version = "0.8.1"
 edition = "2021"
+license = "MIT"
 description = "Core domain types for the Fiber Network"
 
 [dependencies]
