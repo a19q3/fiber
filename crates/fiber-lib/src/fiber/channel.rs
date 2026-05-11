@@ -6770,6 +6770,7 @@ impl ChannelActorState {
                     NetworkActorCommand::VerifyFundingTx {
                         local_tx: self.funding_tx.clone().unwrap_or_default(),
                         remote_tx: msg.tx.clone(),
+                        funding_request: self.get_funding_request(),
                         funding_cell_lock_script: self.get_funding_lock_script(),
                         reply: tx
                     }
@@ -7747,7 +7748,7 @@ impl ChannelActorState {
 
         Ok(())
     }
-    fn is_tx_final(&self, tx: &Transaction) -> Result<bool, ProcessingChannelError> {
+    pub(super) fn is_tx_final(&self, tx: &Transaction) -> Result<bool, ProcessingChannelError> {
         let tx = tx.clone().into_view();
 
         let first_output = tx
@@ -7765,14 +7766,20 @@ impl ChannelActorState {
 
         let current_capacity: u64 = first_output.capacity().unpack();
 
-        // make sure both parties have paid the reserved ckb amount
-        if current_capacity <= self.local_reserved_ckb_amount
-            || current_capacity <= self.remote_reserved_ckb_amount
-        {
-            return Ok(false);
-        }
-
-        if self.funding_udt_type_script.is_some() {
+        if let Some(udt_type_script) = &self.funding_udt_type_script {
+            if first_output.type_().to_opt().as_ref() != Some(udt_type_script) {
+                return Err(ProcessingChannelError::InvalidState(
+                    "Invalid funding transaction UDT type script".to_string(),
+                ));
+            }
+            let required_capacity = self.get_total_reserved_ckb_amount();
+            if current_capacity != required_capacity {
+                debug!(
+                    "UDT funding tx capacity is not final: current={}, required={}",
+                    current_capacity, required_capacity
+                );
+                return Ok(false);
+            }
             let (_output, data) =
                 tx.output_with_data(0)
                     .ok_or(ProcessingChannelError::InvalidParameter(

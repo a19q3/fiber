@@ -1,8 +1,9 @@
 use crate::ckb::tests::test_utils::complete_commitment_tx;
 use crate::fiber::channel::{
-    AddTlcResponse, ChannelActorStateStore, ChannelOpenRecordStore, ReloadParams, ReplayOrderHint,
-    UpdateCommand, DEFAULT_COMMITMENT_FEE_RATE, DEFAULT_MAX_TLC_VALUE_IN_FLIGHT,
-    MAX_COMMITMENT_DELAY_EPOCHS, MIN_COMMITMENT_DELAY_EPOCHS, XUDT_COMPATIBLE_WITNESS,
+    AddTlcResponse, ChannelActorState, ChannelActorStateStore, ChannelOpenRecordStore,
+    ReloadParams, ReplayOrderHint, UpdateCommand, DEFAULT_COMMITMENT_FEE_RATE, DEFAULT_FEE_RATE,
+    DEFAULT_MAX_TLC_VALUE_IN_FLIGHT, MAX_COMMITMENT_DELAY_EPOCHS, MAX_TLC_NUMBER_IN_FLIGHT,
+    MIN_COMMITMENT_DELAY_EPOCHS, XUDT_COMPATIBLE_WITNESS,
 };
 use crate::fiber::config::{
     DEFAULT_COMMITMENT_DELAY_EPOCHS, DEFAULT_FINAL_TLC_EXPIRY_DELTA, DEFAULT_TLC_EXPIRY_DELTA,
@@ -41,26 +42,104 @@ use crate::{
 };
 use ckb_types::core::EpochNumberWithFraction;
 use ckb_types::{
-    core::{tx_pool::TxStatus, FeeRate},
-    packed::{CellDep, CellInput, Script, Transaction},
+    core::{tx_pool::TxStatus, Capacity, FeeRate},
+    packed::{Byte, Byte32, CellDep, CellInput, CellOutput, Script, Transaction},
     prelude::{AsTransactionBuilder, Builder, Entity, IntoTransactionView, Pack, Unpack},
 };
 use fiber_types::{
     derive_private_key, derive_tlc_pubkey, AddTlcCommand, AwaitingChannelReadyFlags,
     AwaitingTxSignaturesFlags, ChannelConstraints, ChannelOpeningStatus, ChannelState,
-    CollaboratingFundingTxFlags, HashAlgorithm, InMemorySigner, NegotiatingFundingFlags,
-    OutboundTlcStatus, PaymentHopData, PaymentStatus, Privkey, RemoveTlcFulfill, RemoveTlcReason,
-    RetryableTlcOperation, ShuttingDownFlags, SigningCommitmentFlags, TLCId, TlcErrPacket,
-    TlcErrorCode, TlcStatus, NO_SHARED_SECRET,
+    ChannelTlcInfo, CollaboratingFundingTxFlags, HashAlgorithm, InMemorySigner,
+    NegotiatingFundingFlags, OutboundTlcStatus, PaymentHopData, PaymentStatus, Privkey,
+    RemoveTlcFulfill, RemoveTlcReason, RetryableTlcOperation, ShuttingDownFlags,
+    SigningCommitmentFlags, TLCId, TlcErrPacket, TlcErrorCode, TlcStatus, NO_SHARED_SECRET,
 };
 use fiber_types::{CloseFlags, FeatureVector};
 use musig2::secp::Point;
-use musig2::KeyAggContext;
-use ractor::call;
+use musig2::{KeyAggContext, PubNonce, SecNonce};
+use ractor::{call, Actor, ActorProcessingErr, ActorRef};
 use secp256k1::SECP256K1;
 use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, error};
+
+struct NoopNetworkActor;
+
+#[async_trait::async_trait]
+impl Actor for NoopNetworkActor {
+    type Msg = NetworkActorMessage;
+    type State = ();
+    type Arguments = ();
+
+    async fn pre_start(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        _args: Self::Arguments,
+    ) -> Result<Self::State, ActorProcessingErr> {
+        Ok(())
+    }
+
+    async fn handle(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        _message: Self::Msg,
+        _state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        Ok(())
+    }
+}
+
+fn dummy_udt_type_script() -> Script {
+    Script::new_builder()
+        .code_hash(Byte32::from_slice(&[1u8; 32]).unwrap())
+        .hash_type(Byte::new(0))
+        .build()
+}
+
+fn dummy_pubnonce(seed: u8) -> PubNonce {
+    SecNonce::build([seed; 32]).build().public_nonce()
+}
+
+async fn dummy_channel_state(udt_type_script: Script) -> ChannelActorState {
+    let (network, _handle) = Actor::spawn(None, NoopNetworkActor, ())
+        .await
+        .expect("spawn noop network actor");
+    let local_node_key = Privkey::from(&[1u8; 32]);
+    let remote_node_key = Privkey::from(&[2u8; 32]);
+    let remote_signer = InMemorySigner::generate_from_seed(&[3u8; 32]);
+
+    ChannelActorState::new_inbound_channel(
+        Hash256::default(),
+        None,
+        false,
+        1_000_000,
+        14_200_000_000,
+        DEFAULT_COMMITMENT_FEE_RATE,
+        DEFAULT_COMMITMENT_DELAY_EPOCHS,
+        DEFAULT_FEE_RATE,
+        Some(udt_type_script),
+        &[4u8; 32],
+        local_node_key.pubkey(),
+        remote_node_key.pubkey(),
+        Script::default(),
+        Script::default(),
+        500_000,
+        14_200_000_000,
+        remote_signer.get_base_public_keys(),
+        dummy_pubnonce(5),
+        dummy_pubnonce(6),
+        None,
+        Privkey::from(&[7u8; 32]).pubkey(),
+        Privkey::from(&[8u8; 32]).pubkey(),
+        DEFAULT_MAX_TLC_VALUE_IN_FLIGHT,
+        MAX_TLC_NUMBER_IN_FLIGHT,
+        MAX_TLC_NUMBER_IN_FLIGHT,
+        DEFAULT_MAX_TLC_VALUE_IN_FLIGHT,
+        ChannelTlcInfo::default(),
+        network,
+        local_node_key,
+    )
+}
 
 fn create_deferred_replay_test_add_tlc(channel_id: Hash256, tlc_id: u64) -> AddTlc {
     AddTlc {
@@ -105,6 +184,33 @@ fn stop_channel_actor(node: &NetworkNode, channel_id: Hash256) {
             }),
         ))
         .expect("channel actor alive");
+}
+
+#[tokio::test]
+async fn test_is_tx_final_rejects_underfunded_udt_funding_cell() {
+    let udt_type_script = dummy_udt_type_script();
+    let state = dummy_channel_state(udt_type_script.clone()).await;
+    let underfunded_capacity = state.local_reserved_ckb_amount + 1;
+    let funding_output = CellOutput::new_builder()
+        .capacity(Capacity::shannons(underfunded_capacity).pack())
+        .type_(Some(udt_type_script).pack())
+        .lock(state.get_funding_lock_script())
+        .build();
+    let tx = Transaction::default()
+        .as_advanced_builder()
+        .set_outputs(vec![funding_output])
+        .set_outputs_data(vec![state
+            .get_liquid_capacity()
+            .to_le_bytes()
+            .to_vec()
+            .pack()])
+        .build()
+        .data();
+
+    assert!(
+        !state.is_tx_final(&tx).expect("valid tx shape"),
+        "underfunded UDT funding cell must not be final"
+    );
 }
 
 #[tokio::test]

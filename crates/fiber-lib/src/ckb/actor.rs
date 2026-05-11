@@ -59,6 +59,7 @@ pub enum CkbChainMessage {
     VerifyFundingTx {
         local_tx: packed::Transaction,
         remote_tx: packed::Transaction,
+        funding_request: FundingRequest,
         funding_cell_lock_script: packed::Script,
         reply: RpcReplyPort<Result<(), FundingError>>,
     },
@@ -142,13 +143,18 @@ impl Actor for CkbChainActor {
                     request.udt_type_script.is_some(),
                     tx.as_ref().is_some(),
                 );
-                let context = state.build_funding_context(request.script.clone());
-                let result = match state.config.funding_tx_shell_builder_as_deref() {
-                    None => {
-                        tx.fulfill(request, context, &mut state.live_cells_exclusion_map)
-                            .await
-                    }
-                    Some(shell_script) => fund_via_shell(shell_script, tx, request, context).await,
+                let context = state.build_funding_context(&request, request.script.clone());
+                let result = match context {
+                    Ok(context) => match state.config.funding_tx_shell_builder_as_deref() {
+                        None => {
+                            tx.fulfill(request, context, &mut state.live_cells_exclusion_map)
+                                .await
+                        }
+                        Some(shell_script) => {
+                            fund_via_shell(shell_script, tx, request, context).await
+                        }
+                    },
+                    Err(err) => Err(err),
                 };
                 match &result {
                     Ok(funding_tx) => debug!(
@@ -186,6 +192,23 @@ impl Actor for CkbChainActor {
                     funding_source_lock_script,
                     funding_source_lock_script_cell_deps,
                     funding_cell_lock_script,
+                    expected_funding_cell_capacity: match request.expected_funding_cell_capacity() {
+                        Ok(capacity) => capacity,
+                        Err(err) => {
+                            let _ = reply.send(Err(err));
+                            return Ok(());
+                        }
+                    },
+                    expected_peer_funding_cell_capacity: match request
+                        .expected_peer_funding_cell_capacity()
+                    {
+                        Ok(capacity) => capacity,
+                        Err(err) => {
+                            let _ = reply.send(Err(err));
+                            return Ok(());
+                        }
+                    },
+                    expected_funding_udt_type_script: request.udt_type_script.clone(),
                 };
                 let result = funding_tx
                     .build_unsigned_for_external_funding(
@@ -206,6 +229,7 @@ impl Actor for CkbChainActor {
             CkbChainMessage::VerifyFundingTx {
                 local_tx,
                 remote_tx,
+                funding_request,
                 funding_cell_lock_script,
                 reply,
             } => {
@@ -218,10 +242,15 @@ impl Actor for CkbChainActor {
                     remote_tx_hash,
                 );
                 let mut funding_tx: FundingTx = local_tx.into();
-                let context = state.build_funding_context(funding_cell_lock_script);
-                let result = funding_tx
-                    .update_for_peer(remote_tx.into_view(), context)
-                    .await;
+                let result =
+                    match state.build_funding_context(&funding_request, funding_cell_lock_script) {
+                        Ok(context) => {
+                            funding_tx
+                                .update_for_peer(remote_tx.into_view(), context)
+                                .await
+                        }
+                        Err(err) => Err(err),
+                    };
                 if let Err(ref err) = result {
                     debug!(
                         "[{}] VerifyFundingTx failed for remote_tx_hash={}: {}",
@@ -351,13 +380,20 @@ impl Actor for CkbChainActor {
 }
 
 impl CkbChainState {
-    fn build_funding_context(&self, funding_cell_lock_script: packed::Script) -> FundingContext {
-        FundingContext {
+    fn build_funding_context(
+        &self,
+        request: &FundingRequest,
+        funding_cell_lock_script: packed::Script,
+    ) -> Result<FundingContext, FundingError> {
+        Ok(FundingContext {
             rpc_url: self.config.rpc_url.clone(),
             funding_source_lock_script: self.funding_source_lock_script.clone(),
             funding_source_lock_script_cell_deps: Vec::new(),
             funding_cell_lock_script,
-        }
+            expected_funding_cell_capacity: request.expected_funding_cell_capacity()?,
+            expected_peer_funding_cell_capacity: request.expected_peer_funding_cell_capacity()?,
+            expected_funding_udt_type_script: request.udt_type_script.clone(),
+        })
     }
 }
 

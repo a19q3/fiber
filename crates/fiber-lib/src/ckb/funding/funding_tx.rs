@@ -178,6 +178,42 @@ pub struct FundingRequest {
     pub remote_reserved_ckb_amount: u64,
 }
 
+impl FundingRequest {
+    pub fn expected_funding_cell_capacity(&self) -> Result<u64, FundingError> {
+        let reserved_ckb_amount = self
+            .local_reserved_ckb_amount
+            .checked_add(self.remote_reserved_ckb_amount)
+            .ok_or(FundingError::OverflowError)?;
+
+        if self.udt_type_script.is_some() {
+            Ok(reserved_ckb_amount)
+        } else {
+            let local_amount =
+                u64::try_from(self.local_amount).map_err(|_| FundingError::OverflowError)?;
+            let remote_amount =
+                u64::try_from(self.remote_amount).map_err(|_| FundingError::OverflowError)?;
+
+            local_amount
+                .checked_add(remote_amount)
+                .and_then(|amount| amount.checked_add(reserved_ckb_amount))
+                .ok_or(FundingError::OverflowError)
+        }
+    }
+
+    pub fn expected_peer_funding_cell_capacity(&self) -> Result<u64, FundingError> {
+        if self.udt_type_script.is_some() {
+            Ok(self.remote_reserved_ckb_amount)
+        } else {
+            let remote_amount =
+                u64::try_from(self.remote_amount).map_err(|_| FundingError::OverflowError)?;
+
+            remote_amount
+                .checked_add(self.remote_reserved_ckb_amount)
+                .ok_or(FundingError::OverflowError)
+        }
+    }
+}
+
 // TODO: trace locked cells
 #[derive(Clone, Debug)]
 pub struct FundingContext {
@@ -185,6 +221,9 @@ pub struct FundingContext {
     pub funding_source_lock_script: packed::Script,
     pub funding_source_lock_script_cell_deps: Vec<packed::CellDep>,
     pub funding_cell_lock_script: packed::Script,
+    pub expected_funding_cell_capacity: u64,
+    pub expected_peer_funding_cell_capacity: u64,
+    pub expected_funding_udt_type_script: Option<packed::Script>,
 }
 
 struct ExternalFundingCellDepResolver {
@@ -892,19 +931,36 @@ impl FundingTx {
             );
             return Err(FundingError::InvalidPeerFundingTx);
         }
-        // The first output MUST be the funding cell
-        if let Some(output) = remote_tx.output(0) {
-            if output.lock() != context.funding_cell_lock_script {
-                debug!("invalid funding tx (outputs[0]): not a funding cell",);
+        // The first output MUST be the funding cell.
+        let Some(output) = remote_tx.output(0) else {
+            debug!("invalid funding tx (outputs[0]): missing funding cell");
+            return Err(FundingError::InvalidPeerFundingTx);
+        };
+        if output.lock() != context.funding_cell_lock_script {
+            debug!("invalid funding tx (outputs[0]): not a funding cell",);
+            return Err(FundingError::InvalidPeerFundingTx);
+        }
+        if output.type_().to_opt().as_ref() != context.expected_funding_udt_type_script.as_ref() {
+            debug!("invalid funding tx (outputs[0]): unexpected type script");
+            return Err(FundingError::InvalidPeerFundingTx);
+        }
+        let expected_capacity = if local_tx.output(0).is_some() {
+            context.expected_funding_cell_capacity
+        } else {
+            context.expected_peer_funding_cell_capacity
+        };
+        let remote_capacity: u64 = output.capacity().unpack();
+        if remote_capacity < expected_capacity {
+            debug!(
+                "invalid funding tx (outputs[0]): capacity {} is less than expected {}",
+                remote_capacity, expected_capacity
+            );
+            return Err(FundingError::InvalidPeerFundingTx);
+        }
+        if let Some(data) = remote_tx.outputs_data().get(0) {
+            if output.type_().is_none() && !data.is_empty() {
+                debug!("invalid funding tx (outputs_data[0]): data is not allowed for CKB channel",);
                 return Err(FundingError::InvalidPeerFundingTx);
-            }
-            if let Some(data) = remote_tx.outputs_data().get(0) {
-                if output.type_().is_none() && !data.is_empty() {
-                    debug!(
-                        "invalid funding tx (outputs_data[0]): data is not allowed for CKB channel",
-                    );
-                    return Err(FundingError::InvalidPeerFundingTx);
-                }
             }
         }
         // Peer SHOULD NOT modify existing outputs
@@ -962,11 +1018,40 @@ mod tests {
     fn dummy_funding_context() -> FundingContext {
         let script = Script::default();
         FundingContext {
-            rpc_url: String::new(),
+            rpc_url: "http://127.0.0.1:8114".to_string(),
             funding_source_lock_script: script.clone(),
             funding_source_lock_script_cell_deps: Vec::new(),
             funding_cell_lock_script: script,
+            expected_funding_cell_capacity: 0,
+            expected_peer_funding_cell_capacity: 0,
+            expected_funding_udt_type_script: None,
         }
+    }
+
+    fn dummy_udt_type_script() -> Script {
+        Script::new_builder()
+            .code_hash(packed::Byte32::from_slice(&[1u8; 32]).unwrap())
+            .hash_type(packed::Byte::new(0))
+            .build()
+    }
+
+    fn dummy_udt_funding_tx(
+        funding_cell_lock_script: Script,
+        udt_type_script: Script,
+        capacity: u64,
+        udt_amount: u128,
+    ) -> TransactionView {
+        let funding_output = packed::CellOutput::new_builder()
+            .capacity(Capacity::shannons(capacity).pack())
+            .type_(Some(udt_type_script).pack())
+            .lock(funding_cell_lock_script)
+            .build();
+
+        packed::Transaction::default()
+            .as_advanced_builder()
+            .set_outputs(vec![funding_output])
+            .set_outputs_data(vec![udt_amount.to_le_bytes().to_vec().pack()])
+            .build()
     }
 
     fn dummy_funding_builder(
@@ -1017,10 +1102,7 @@ mod tests {
     #[test]
     fn test_external_funding_build_udt_funding_cell() {
         let context = dummy_funding_context();
-        let udt_type_script = Script::new_builder()
-            .code_hash(packed::Byte32::from_slice(&[1u8; 32]).unwrap())
-            .hash_type(packed::Byte::new(0))
-            .build();
+        let udt_type_script = dummy_udt_type_script();
 
         let request = FundingRequest {
             script: Script::default(),
@@ -1098,10 +1180,7 @@ mod tests {
     #[test]
     fn test_external_funding_build_udt_funding_cell_after_remote_added() {
         let context = dummy_funding_context();
-        let udt_type_script = Script::new_builder()
-            .code_hash(packed::Byte32::from_slice(&[1u8; 32]).unwrap())
-            .hash_type(packed::Byte::new(0))
-            .build();
+        let udt_type_script = dummy_udt_type_script();
         let request = FundingRequest {
             script: Script::default(),
             udt_type_script: Some(udt_type_script.clone()),
@@ -1143,6 +1222,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_update_for_peer_rejects_underfunded_udt_funding_cell() {
+        let mut context = dummy_funding_context();
+        let udt_type_script = dummy_udt_type_script();
+        let request = FundingRequest {
+            script: context.funding_cell_lock_script.clone(),
+            udt_type_script: Some(udt_type_script.clone()),
+            local_amount: 1_000_000,
+            remote_amount: 500_000,
+            funding_fee_rate: 1000,
+            local_reserved_ckb_amount: 14_200_000_000,
+            remote_reserved_ckb_amount: 14_200_000_000,
+        };
+        context.expected_funding_cell_capacity = request
+            .expected_funding_cell_capacity()
+            .expect("expected capacity");
+        context.expected_peer_funding_cell_capacity = request
+            .expected_peer_funding_cell_capacity()
+            .expect("expected peer capacity");
+        context.expected_funding_udt_type_script = request.udt_type_script.clone();
+
+        let local_tx = dummy_udt_funding_tx(
+            context.funding_cell_lock_script.clone(),
+            udt_type_script.clone(),
+            request.local_reserved_ckb_amount,
+            request.local_amount,
+        );
+        let remote_tx = dummy_udt_funding_tx(
+            context.funding_cell_lock_script.clone(),
+            udt_type_script,
+            request.local_reserved_ckb_amount + 1,
+            request.local_amount + request.remote_amount,
+        );
+        let mut funding_tx: FundingTx = local_tx.into();
+
+        let result = funding_tx.update_for_peer(remote_tx, context).await;
+
+        assert!(
+            matches!(result, Err(FundingError::InvalidPeerFundingTx)),
+            "underfunded UDT funding cell must be rejected, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_for_peer_accepts_initial_udt_peer_contribution() {
+        let mut context = dummy_funding_context();
+        let udt_type_script = dummy_udt_type_script();
+        let request = FundingRequest {
+            script: context.funding_cell_lock_script.clone(),
+            udt_type_script: Some(udt_type_script.clone()),
+            local_amount: 1_000_000,
+            remote_amount: 500_000,
+            funding_fee_rate: 1000,
+            local_reserved_ckb_amount: 14_200_000_000,
+            remote_reserved_ckb_amount: 14_200_000_000,
+        };
+        context.expected_funding_cell_capacity = request
+            .expected_funding_cell_capacity()
+            .expect("expected capacity");
+        context.expected_peer_funding_cell_capacity = request
+            .expected_peer_funding_cell_capacity()
+            .expect("expected peer capacity");
+        context.expected_funding_udt_type_script = request.udt_type_script.clone();
+
+        let remote_tx = dummy_udt_funding_tx(
+            context.funding_cell_lock_script.clone(),
+            udt_type_script,
+            request.remote_reserved_ckb_amount,
+            request.remote_amount,
+        );
+        let mut funding_tx = FundingTx::new();
+
+        let result = funding_tx.update_for_peer(remote_tx, context).await;
+
+        assert!(
+            result.is_ok(),
+            "initial UDT peer funding contribution should be accepted, got {result:?}"
+        );
+    }
+
     #[test]
     fn test_external_funding_build_funding_cell_overflow() {
         let context = dummy_funding_context();
@@ -1170,10 +1329,7 @@ mod tests {
     #[test]
     fn test_external_funding_build_udt_funding_cell_overflow() {
         let context = dummy_funding_context();
-        let udt_type_script = Script::new_builder()
-            .code_hash(packed::Byte32::from_slice(&[1u8; 32]).unwrap())
-            .hash_type(packed::Byte::new(0))
-            .build();
+        let udt_type_script = dummy_udt_type_script();
 
         // UDT amounts that overflow u128
         let request = FundingRequest {

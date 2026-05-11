@@ -397,16 +397,22 @@ impl Actor for MockChainActor {
                     .map(|x| x.outputs())
                     .unwrap_or_default();
 
-                let mut ckb_amount = request.local_reserved_ckb_amount;
-
-                let mut capacity =
-                    request.local_amount + (request.local_reserved_ckb_amount as u128);
-                if capacity > u64::MAX as u128 {
-                    let _ = reply_port.send(Err(FundingError::CkbTxBuilderError(
-                        TxBuilderError::Other(anyhow!("capacity overflow")),
-                    )));
-                    return Ok(());
-                }
+                let local_ckb_capacity = if request.udt_type_script.is_none() {
+                    match request
+                        .local_amount
+                        .checked_add(request.local_reserved_ckb_amount as u128)
+                    {
+                        Some(capacity) if capacity <= u64::MAX as u128 => Some(capacity as u64),
+                        _ => {
+                            let _ = reply_port.send(Err(FundingError::CkbTxBuilderError(
+                                TxBuilderError::Other(anyhow!("capacity overflow")),
+                            )));
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 let outputs = match outputs.get(0) {
                     Some(output) => {
@@ -416,14 +422,15 @@ impl Actor for MockChainActor {
                                 );
                             return Ok(());
                         }
-                        ckb_amount = ckb_amount
-                            .checked_add(request.remote_reserved_ckb_amount)
-                            .expect("valid ckb amount");
-
                         if let Some(ref udt_script) = request.udt_type_script {
+                            let ckb_amount = request
+                                .local_reserved_ckb_amount
+                                .checked_add(request.remote_reserved_ckb_amount)
+                                .expect("valid ckb amount");
                             let udt_output = packed::CellOutput::new_builder()
                                 .capacity(Capacity::shannons(ckb_amount).pack())
                                 .type_(Some(udt_script.clone()).pack())
+                                .lock(request.script.clone())
                                 .build();
 
                             let mut outputs_builder = outputs.as_builder();
@@ -431,6 +438,8 @@ impl Actor for MockChainActor {
                             outputs_builder.build()
                         } else {
                             let current_capacity: u64 = output.capacity().unpack();
+                            let mut capacity =
+                                local_ckb_capacity.expect("CKB funding capacity computed") as u128;
                             capacity += current_capacity as u128;
                             if capacity > u64::MAX as u128 {
                                 let _ = reply_port.send(Err(FundingError::CkbTxBuilderError(
@@ -445,15 +454,37 @@ impl Actor for MockChainActor {
                             outputs_builder.build()
                         }
                     }
-                    None => [CellOutput::new_builder()
-                        .capacity(request.local_amount as u64 + request.local_reserved_ckb_amount)
-                        .lock(request.script.clone())
-                        .build()]
-                    .pack(),
+                    None => {
+                        let output = if let Some(ref udt_script) = request.udt_type_script {
+                            CellOutput::new_builder()
+                                .capacity(
+                                    Capacity::shannons(request.local_reserved_ckb_amount).pack(),
+                                )
+                                .lock(request.script.clone())
+                                .type_(Some(udt_script.clone()).pack())
+                                .build()
+                        } else {
+                            CellOutput::new_builder()
+                                .capacity(
+                                    local_ckb_capacity.expect("CKB funding capacity computed"),
+                                )
+                                .lock(request.script.clone())
+                                .build()
+                        };
+                        [output].pack()
+                    }
                 };
 
                 let outputs_data = if let Some(ref _udt_script) = request.udt_type_script {
-                    let udt_amount = request.local_amount + request.remote_amount;
+                    let remote_funded = fulfilled_tx
+                        .as_ref()
+                        .map(|tx| !tx.outputs().is_empty())
+                        .unwrap_or(false);
+                    let udt_amount = if remote_funded {
+                        request.local_amount + request.remote_amount
+                    } else {
+                        request.local_amount
+                    };
                     let mut data = BytesMut::with_capacity(16);
                     data.put(&udt_amount.to_le_bytes()[..]);
                     vec![data.freeze().pack()].pack()
@@ -546,7 +577,21 @@ impl Actor for MockChainActor {
                     }
 
                     let context = &mut MOCK_CONTEXT.write().unwrap().context;
-                    match context.verify_tx(&tx, MAX_CYCLES) {
+                    let tx_for_verify = if tx
+                        .outputs()
+                        .into_iter()
+                        .any(|output| output.type_().is_some())
+                    {
+                        let outputs = tx
+                            .outputs()
+                            .into_iter()
+                            .map(|output| output.as_builder().type_(None::<Script>.pack()).build())
+                            .collect();
+                        tx.as_advanced_builder().set_outputs(outputs).build()
+                    } else {
+                        tx.clone()
+                    };
+                    match context.verify_tx(&tx_for_verify, MAX_CYCLES) {
                         Ok(c) => {
                             debug!("Verified transaction: {:?} with {} CPU cycles", tx, c);
                             // Also save the outputs to the context, so that we can refer to

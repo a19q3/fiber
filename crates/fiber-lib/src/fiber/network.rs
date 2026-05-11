@@ -538,6 +538,7 @@ pub enum NetworkActorCommand {
     VerifyFundingTx {
         local_tx: Transaction,
         remote_tx: Transaction,
+        funding_request: FundingRequest,
         funding_cell_lock_script: Script,
         reply: RpcReplyPort<Result<(), FundingError>>,
     },
@@ -2277,6 +2278,7 @@ where
             NetworkActorCommand::VerifyFundingTx {
                 local_tx,
                 remote_tx,
+                funding_request,
                 funding_cell_lock_script,
                 reply,
             } => {
@@ -2285,6 +2287,7 @@ where
                     .send_message(CkbChainMessage::VerifyFundingTx {
                         local_tx,
                         remote_tx,
+                        funding_request,
                         reply,
                         funding_cell_lock_script,
                     });
