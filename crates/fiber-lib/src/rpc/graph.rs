@@ -8,6 +8,7 @@ use fiber_types::Cursor;
 #[cfg(not(target_arch = "wasm32"))]
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::{types::error::INVALID_PARAMS_CODE, types::ErrorObjectOwned};
+use serde::Serialize;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,6 +17,34 @@ pub use fiber_json_types::{
     ChannelInfo, GraphChannelsParams, GraphChannelsResult, GraphNodesParams, GraphNodesResult,
     NodeInfo, UdtArgInfo, UdtCellDep, UdtCfgInfos, UdtDep, UdtScript,
 };
+
+const DEFAULT_GRAPH_PAGINATION_LIMIT: u64 = 500;
+const MAX_GRAPH_PAGINATION_LIMIT: u64 = 500;
+
+fn graph_pagination_limit<T: Serialize>(
+    limit: Option<u64>,
+    params: &T,
+) -> Result<usize, ErrorObjectOwned> {
+    let limit = limit.unwrap_or(DEFAULT_GRAPH_PAGINATION_LIMIT);
+    if limit == 0 {
+        return Err(ErrorObjectOwned::owned(
+            INVALID_PARAMS_CODE,
+            format!(
+                "`limit` must be greater than 0; omit it to use the default {}",
+                DEFAULT_GRAPH_PAGINATION_LIMIT
+            ),
+            Some(params),
+        ));
+    }
+    if limit > MAX_GRAPH_PAGINATION_LIMIT {
+        return Err(ErrorObjectOwned::owned(
+            INVALID_PARAMS_CODE,
+            format!("`limit` must be no greater than {MAX_GRAPH_PAGINATION_LIMIT}"),
+            Some(params),
+        ));
+    }
+    Ok(limit as usize)
+}
 
 fn internal_node_info_to_json(value: crate::fiber::graph::NodeInfo) -> NodeInfo {
     NodeInfo {
@@ -130,8 +159,7 @@ where
         params: GraphNodesParams,
     ) -> Result<GraphNodesResult, ErrorObjectOwned> {
         let network_graph = self.network_graph.read().await;
-        let default_max_limit = 500;
-        let limit = params.limit.unwrap_or(default_max_limit) as usize;
+        let limit = graph_pagination_limit(params.limit, &params)?;
         let cursor = params
             .after
             .as_ref()
@@ -154,9 +182,8 @@ where
         &self,
         params: GraphChannelsParams,
     ) -> Result<GraphChannelsResult, ErrorObjectOwned> {
-        let default_max_limit = 500;
         let network_graph = self.network_graph.read().await;
-        let limit = params.limit.unwrap_or(default_max_limit) as usize;
+        let limit = graph_pagination_limit(params.limit, &params)?;
         let cursor = params
             .after
             .as_ref()
@@ -180,5 +207,46 @@ where
             channels,
             last_cursor,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct TestParams {
+        limit: Option<u64>,
+    }
+
+    #[test]
+    fn graph_pagination_limit_uses_default_for_missing_limit() {
+        let params = TestParams { limit: None };
+        assert_eq!(
+            graph_pagination_limit(params.limit, &params).expect("valid limit"),
+            DEFAULT_GRAPH_PAGINATION_LIMIT as usize
+        );
+    }
+
+    #[test]
+    fn graph_pagination_limit_rejects_zero_limit() {
+        let params = TestParams { limit: Some(0) };
+        let error = graph_pagination_limit(params.limit, &params).expect_err("invalid limit");
+
+        assert_eq!(error.code(), INVALID_PARAMS_CODE);
+        assert!(error.message().contains("greater than 0"));
+    }
+
+    #[test]
+    fn graph_pagination_limit_rejects_limit_above_cap() {
+        let params = TestParams {
+            limit: Some(MAX_GRAPH_PAGINATION_LIMIT + 1),
+        };
+        let error = graph_pagination_limit(params.limit, &params).expect_err("invalid limit");
+
+        assert_eq!(error.code(), INVALID_PARAMS_CODE);
+        assert!(error
+            .message()
+            .contains(&MAX_GRAPH_PAGINATION_LIMIT.to_string()));
     }
 }
