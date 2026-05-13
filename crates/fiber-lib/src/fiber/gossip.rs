@@ -2,7 +2,7 @@ use core::panic;
 use secp256k1::SECP256K1;
 use std::{
     cmp::max,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     marker::PhantomData,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -94,6 +94,13 @@ const GET_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 // The maximum number of concurrent query tasks to run. We will wait for query previous task to exit
 // before start new query tasks. This is to avoid consuming to much bandwidth.
 const MAX_NUM_CONCURRENT_QUERY_TASKS: usize = 10;
+
+const MAX_PENDING_BROADCAST_MESSAGES_PER_PEER: usize = MAX_NUM_OF_BROADCAST_MESSAGES as usize;
+const MAX_PENDING_BROADCAST_MESSAGES_TOTAL: usize =
+    MAX_PENDING_BROADCAST_MESSAGES_PER_PEER * MAX_NUM_CONCURRENT_QUERY_TASKS;
+const MAX_DEPENDENCY_QUERIES_PER_PEER_PER_TICK: usize = DEFAULT_NUM_OF_BROADCAST_MESSAGE as usize;
+const UNKNOWN_CHANNEL_ANNOUNCEMENT_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_UNKNOWN_CHANNEL_ANNOUNCEMENT_CACHE_SIZE: usize = MAX_PENDING_BROADCAST_MESSAGES_TOTAL;
 
 const QUERY_BROADCAST_MESSAGES_TIMEOUT: Duration = Duration::from_secs(20);
 const UPDATE_PEER_FILTER_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -1274,6 +1281,8 @@ pub enum GossipError {
 pub enum GossipMessageProcessingError {
     #[error("The message timestamp is too far in the future: expected to before {1}, has {0}")]
     MessageTooNew(u64, u64),
+    #[error("Missing channel announcement was recently queried: {0:?}")]
+    MissingChannelAnnouncementCached(OutPoint),
     #[error("Failed to process the message: {0}")]
     ProcessingError(String),
     #[error("A newer message is already saved: {0:?}")]
@@ -1284,6 +1293,9 @@ impl GossipMessageProcessingError {
     fn rejected_broadcast_metrics_reason(&self) -> &'static str {
         match self {
             GossipMessageProcessingError::MessageTooNew(_, _) => "message_too_new",
+            GossipMessageProcessingError::MissingChannelAnnouncementCached(_) => {
+                "missing_channel_announcement_cached"
+            }
             GossipMessageProcessingError::ProcessingError(_) => "processing_error",
             GossipMessageProcessingError::NewerMessageSaved(_) => "newer_message_saved",
         }
@@ -1325,6 +1337,78 @@ enum InsertMessageStatus {
     Duplicate,
 }
 
+#[derive(Debug, Clone)]
+struct PendingBroadcastMessage {
+    sequence: u64,
+    message: BroadcastMessage,
+}
+
+#[derive(Debug, Default)]
+struct PendingBroadcastMessages {
+    ordered_messages: VecDeque<PendingBroadcastMessage>,
+    unique_messages: HashSet<BroadcastMessage>,
+}
+
+impl PendingBroadcastMessages {
+    fn len(&self) -> usize {
+        self.ordered_messages.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ordered_messages.is_empty()
+    }
+
+    fn contains(&self, message: &BroadcastMessage) -> bool {
+        self.unique_messages.contains(message)
+    }
+
+    fn front_sequence(&self) -> Option<u64> {
+        self.ordered_messages.front().map(|entry| entry.sequence)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &BroadcastMessage> {
+        self.ordered_messages.iter().map(|entry| &entry.message)
+    }
+
+    fn insert(&mut self, message: BroadcastMessage, sequence: u64) -> bool {
+        if !self.unique_messages.insert(message.clone()) {
+            return false;
+        }
+        self.ordered_messages
+            .push_back(PendingBroadcastMessage { sequence, message });
+        true
+    }
+
+    fn pop_front(&mut self) -> Option<BroadcastMessage> {
+        let message = self.ordered_messages.pop_front()?.message;
+        self.unique_messages.remove(&message);
+        Some(message)
+    }
+
+    fn retain(&mut self, mut should_keep: impl FnMut(&BroadcastMessage) -> bool) {
+        let mut unique_messages = HashSet::with_capacity(self.unique_messages.len());
+        self.ordered_messages.retain(|entry| {
+            let keep = should_keep(&entry.message);
+            if keep {
+                unique_messages.insert(entry.message.clone());
+            }
+            keep
+        });
+        self.unique_messages = unique_messages;
+    }
+
+    fn take_front(&mut self, limit: usize) -> Vec<BroadcastMessage> {
+        let mut messages = Vec::with_capacity(limit.min(self.len()));
+        while messages.len() < limit {
+            match self.pop_front() {
+                Some(message) => messages.push(message),
+                None => break,
+            }
+        }
+        messages
+    }
+}
+
 pub struct ExtendedGossipMessageStoreState<S, C> {
     announce_private_addr: bool,
     store: S,
@@ -1336,7 +1420,11 @@ pub struct ExtendedGossipMessageStoreState<S, C> {
     output_ports: HashMap<u64, BroadcastMessageOutput>,
     // A map from peer pubkey to the messages that need to be saved.
     // Our own messages are always saved directly to the store.
-    messages_to_be_saved: HashMap<Pubkey, HashSet<BroadcastMessage>>,
+    messages_to_be_saved: HashMap<Pubkey, PendingBroadcastMessages>,
+    messages_to_be_saved_count: usize,
+    next_pending_message_sequence: u64,
+    unknown_channel_announcements: HashMap<OutPoint, u64>,
+    unknown_channel_announcement_order: VecDeque<OutPoint>,
     num_query_tasks_running: usize,
 }
 
@@ -1359,6 +1447,10 @@ impl<S: GossipMessageStore, C: CkbChainClient> ExtendedGossipMessageStoreState<S
             next_id: Default::default(),
             output_ports: Default::default(),
             messages_to_be_saved: Default::default(),
+            messages_to_be_saved_count: 0,
+            next_pending_message_sequence: 0,
+            unknown_channel_announcements: Default::default(),
+            unknown_channel_announcement_order: Default::default(),
             num_query_tasks_running: 0,
         }
     }
@@ -1369,18 +1461,13 @@ impl<S: GossipMessageStore, C: CkbChainClient> ExtendedGossipMessageStoreState<S
     async fn prune_messages_to_be_saved(&mut self) -> Vec<BroadcastMessageWithTimestamp> {
         let mut complete_messages = HashSet::new();
         for messages in self.messages_to_be_saved.values() {
-            for message in messages {
+            for message in messages.iter() {
                 if self.has_dependencies_available(message) {
                     complete_messages.insert(message.clone());
                 }
             }
         }
-        self.messages_to_be_saved.retain(|_, messages| {
-            // Remove completed messages
-            messages.retain(|message| !complete_messages.contains(message));
-            // If messages are empty now, delete the kv pair.
-            !messages.is_empty()
-        });
+        self.remove_pending_messages(|message| complete_messages.contains(message));
 
         let mut sorted_messages = complete_messages.into_iter().collect::<Vec<_>>();
         sorted_messages.sort_unstable();
@@ -1483,22 +1570,23 @@ impl<S: GossipMessageStore, C: CkbChainClient> ExtendedGossipMessageStoreState<S
             .take(MAX_NUM_CONCURRENT_QUERY_TASKS - self.num_query_tasks_running)
             .cloned()
             .collect::<Vec<_>>();
-        self.num_query_tasks_running += peers_to_query.len();
 
         for peer in peers_to_query {
             // The assumption is that when a peer sends us a message, it should have all the dependencies.
             // So here we will send queries to the peer for the missing messages.
             let incomplete_messages = self
-                .messages_to_be_saved
-                .remove(&peer)
-                .expect("peer is a key of hashmap");
+                .take_pending_messages_to_query(&peer, MAX_DEPENDENCY_QUERIES_PER_PEER_PER_TICK);
+            if incomplete_messages.is_empty() {
+                continue;
+            }
+            self.num_query_tasks_running += 1;
             let gossip_actor = self.gossip_actor.clone();
             let myself = myself.clone();
-            let incomplete_messages = incomplete_messages.into_iter().collect::<Vec<_>>();
 
             ractor::concurrency::spawn(async move {
                 let mut is_success = true;
                 let n_queries = incomplete_messages.len();
+                let mut missing_channel_announcements = Vec::new();
                 for messages in
                     incomplete_messages.chunks(DEFAULT_NUM_OF_BROADCAST_MESSAGE as usize)
                 {
@@ -1525,9 +1613,33 @@ impl<S: GossipMessageStore, C: CkbChainClient> ExtendedGossipMessageStoreState<S
                         queries.to_vec()
                     ) {
                         Ok(Ok(result)) => {
+                            let missing_queries = result
+                                .missing_queries
+                                .iter()
+                                .copied()
+                                .map(usize::from)
+                                .collect::<HashSet<_>>();
+                            missing_channel_announcements.extend(
+                                missing_queries
+                                    .iter()
+                                    .filter_map(|index| queries.get(*index))
+                                    .map(|query| query.channel_outpoint.clone()),
+                            );
                             let mut all_messages = result.messages;
                             // We need also to save the incomplete messages to the store.
-                            all_messages.extend(messages.iter().map(Clone::clone));
+                            all_messages.extend(messages.iter().filter_map(|message| {
+                                let missing_channel_announcement = match message {
+                                    BroadcastMessage::ChannelUpdate(channel_update) => queries
+                                        .iter()
+                                        .position(|query| {
+                                            query.channel_outpoint
+                                                == channel_update.channel_outpoint
+                                        })
+                                        .is_some_and(|index| missing_queries.contains(&index)),
+                                    _ => false,
+                                };
+                                (!missing_channel_announcement).then(|| message.clone())
+                            }));
                             myself
                                 .send_message(ExtendedGossipMessageStoreMessage::SaveMessages(
                                     peer,
@@ -1551,6 +1663,7 @@ impl<S: GossipMessageStore, C: CkbChainClient> ExtendedGossipMessageStoreState<S
                             n_queries,
                             peer,
                             is_success,
+                            missing_channel_announcements,
                         },
                     ))
                     .expect("actor alive")
@@ -1571,7 +1684,7 @@ impl<S: GossipMessageStore, C: CkbChainClient> ExtendedGossipMessageStoreState<S
     ) -> Option<ChannelAnnouncement> {
         self.messages_to_be_saved
             .values()
-            .flatten()
+            .flat_map(PendingBroadcastMessages::iter)
             .find_map(|m| match m {
                 BroadcastMessage::ChannelAnnouncement(channel_announcement)
                     if &channel_announcement.channel_outpoint == outpoint =>
@@ -1632,15 +1745,44 @@ impl<S: GossipMessageStore, C: CkbChainClient> ExtendedGossipMessageStoreState<S
             }
         }
 
+        match message {
+            BroadcastMessage::ChannelAnnouncement(channel_announcement) => {
+                self.remove_unknown_channel_announcement(&channel_announcement.channel_outpoint);
+            }
+            BroadcastMessage::ChannelUpdate(channel_update)
+                if self
+                    .get_channel_announcement(&channel_update.channel_outpoint)
+                    .is_none()
+                    && self.is_channel_announcement_recently_missing(
+                        &channel_update.channel_outpoint,
+                    ) =>
+            {
+                return Err(
+                    GossipMessageProcessingError::MissingChannelAnnouncementCached(
+                        channel_update.channel_outpoint.clone(),
+                    ),
+                );
+            }
+            _ => {}
+        }
+
         trace!(
             "New gossip message saved to memory: peer {:?}, message {:?}",
             pubkey,
             message
         );
-        self.messages_to_be_saved
+        let sequence = self.next_pending_message_sequence;
+        self.next_pending_message_sequence = self.next_pending_message_sequence.wrapping_add(1);
+        let inserted = self
+            .messages_to_be_saved
             .entry(*pubkey)
             .or_default()
-            .insert(message.clone());
+            .insert(message.clone(), sequence);
+        if !inserted {
+            return Ok(InsertMessageStatus::Duplicate);
+        }
+        self.messages_to_be_saved_count += 1;
+        self.enforce_pending_message_limits(pubkey);
         Ok(if duplicate_from_other_peer {
             InsertMessageStatus::InsertedDuplicate
         } else {
@@ -1655,6 +1797,176 @@ impl<S: GossipMessageStore, C: CkbChainClient> ExtendedGossipMessageStoreState<S
                 .is_some(),
             _ => true,
         }
+    }
+
+    fn take_pending_messages_to_query(
+        &mut self,
+        peer: &Pubkey,
+        limit: usize,
+    ) -> Vec<BroadcastMessage> {
+        let Some(messages) = self.messages_to_be_saved.get_mut(peer) else {
+            return Vec::new();
+        };
+        let messages_to_query = messages.take_front(limit);
+        self.messages_to_be_saved_count = self
+            .messages_to_be_saved_count
+            .saturating_sub(messages_to_query.len());
+        if messages.is_empty() {
+            self.messages_to_be_saved.remove(peer);
+        }
+        messages_to_query
+    }
+
+    fn remove_pending_messages(
+        &mut self,
+        mut should_remove: impl FnMut(&BroadcastMessage) -> bool,
+    ) {
+        let mut removed_messages = 0;
+        let mut empty_peers = Vec::new();
+        for (peer, messages) in self.messages_to_be_saved.iter_mut() {
+            let original_len = messages.len();
+            messages.retain(|message| !should_remove(message));
+            removed_messages += original_len - messages.len();
+            if messages.is_empty() {
+                empty_peers.push(*peer);
+            }
+        }
+        for peer in empty_peers {
+            self.messages_to_be_saved.remove(&peer);
+        }
+        self.messages_to_be_saved_count = self
+            .messages_to_be_saved_count
+            .saturating_sub(removed_messages);
+    }
+
+    fn enforce_pending_message_limits(&mut self, peer: &Pubkey) {
+        while self
+            .messages_to_be_saved
+            .get(peer)
+            .is_some_and(|messages| messages.len() > MAX_PENDING_BROADCAST_MESSAGES_PER_PEER)
+        {
+            self.drop_oldest_pending_message_from_peer(peer);
+        }
+
+        while self.messages_to_be_saved_count > MAX_PENDING_BROADCAST_MESSAGES_TOTAL {
+            let Some(peer_to_drop) = self.oldest_pending_message_peer() else {
+                break;
+            };
+            self.drop_oldest_pending_message_from_peer(&peer_to_drop);
+        }
+    }
+
+    fn oldest_pending_message_peer(&self) -> Option<Pubkey> {
+        self.messages_to_be_saved
+            .iter()
+            .filter_map(|(peer, messages)| {
+                messages.front_sequence().map(|sequence| (*peer, sequence))
+            })
+            .min_by_key(|(_, sequence)| *sequence)
+            .map(|(peer, _)| peer)
+    }
+
+    fn drop_oldest_pending_message_from_peer(&mut self, peer: &Pubkey) {
+        let Some(messages) = self.messages_to_be_saved.get_mut(peer) else {
+            return;
+        };
+        let Some(message) = messages.pop_front() else {
+            return;
+        };
+        self.messages_to_be_saved_count = self.messages_to_be_saved_count.saturating_sub(1);
+        observe_rejected_broadcast_message("pending_limit_exceeded");
+        trace!(
+            "Dropped pending gossip message due to pending limit: peer {:?}, message {:?}",
+            peer,
+            message
+        );
+        if messages.is_empty() {
+            self.messages_to_be_saved.remove(peer);
+        }
+    }
+
+    fn cache_missing_channel_announcements<I>(&mut self, outpoints: I)
+    where
+        I: IntoIterator<Item = OutPoint>,
+    {
+        self.prune_expired_unknown_channel_announcements();
+        let expires_at = now_timestamp_as_millis_u64()
+            + UNKNOWN_CHANNEL_ANNOUNCEMENT_CACHE_TTL.as_millis() as u64;
+        for outpoint in outpoints {
+            self.remove_unknown_channel_announcement(&outpoint);
+            self.unknown_channel_announcements
+                .insert(outpoint.clone(), expires_at);
+            self.unknown_channel_announcement_order.push_back(outpoint);
+        }
+
+        while self.unknown_channel_announcements.len() > MAX_UNKNOWN_CHANNEL_ANNOUNCEMENT_CACHE_SIZE
+        {
+            let Some(outpoint) = self.unknown_channel_announcement_order.pop_front() else {
+                break;
+            };
+            self.unknown_channel_announcements.remove(&outpoint);
+        }
+    }
+
+    fn is_channel_announcement_recently_missing(&mut self, outpoint: &OutPoint) -> bool {
+        self.prune_expired_unknown_channel_announcements();
+        self.unknown_channel_announcements.contains_key(outpoint)
+    }
+
+    fn remove_unknown_channel_announcement(&mut self, outpoint: &OutPoint) {
+        if self
+            .unknown_channel_announcements
+            .remove(outpoint)
+            .is_some()
+        {
+            self.unknown_channel_announcement_order
+                .retain(|cached_outpoint| cached_outpoint != outpoint);
+        }
+    }
+
+    fn prune_expired_unknown_channel_announcements(&mut self) {
+        let now = now_timestamp_as_millis_u64();
+        self.unknown_channel_announcements
+            .retain(|_, expires_at| *expires_at > now);
+        self.unknown_channel_announcement_order
+            .retain(|outpoint| self.unknown_channel_announcements.contains_key(outpoint));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ckb_types::{packed::Byte32, prelude::Entity};
+    use fiber_types::{ChannelUpdateChannelFlags, ChannelUpdateMessageFlags};
+
+    fn pending_channel_update(seed: u8) -> BroadcastMessage {
+        let tx_hash = Byte32::from_slice(&[seed; 32]).expect("valid tx hash");
+        BroadcastMessage::ChannelUpdate(ChannelUpdate {
+            signature: None,
+            chain_hash: Hash256::default(),
+            channel_outpoint: OutPoint::new(tx_hash, seed as u32),
+            timestamp: seed as u64,
+            message_flags: ChannelUpdateMessageFlags::UPDATE_OF_NODE1,
+            channel_flags: ChannelUpdateChannelFlags::empty(),
+            tlc_expiry_delta: 1,
+            tlc_minimum_value: 1,
+            tlc_fee_proportional_millionths: 1,
+        })
+    }
+
+    #[test]
+    fn pending_broadcast_messages_keep_lru_order_and_deduplicate() {
+        let first = pending_channel_update(1);
+        let second = pending_channel_update(2);
+        let mut pending_messages = PendingBroadcastMessages::default();
+
+        assert!(pending_messages.insert(first.clone(), 0));
+        assert!(!pending_messages.insert(first.clone(), 1));
+        assert!(pending_messages.insert(second.clone(), 2));
+        assert_eq!(pending_messages.len(), 2);
+        assert_eq!(pending_messages.take_front(1), vec![first]);
+        assert_eq!(pending_messages.pop_front(), Some(second));
+        assert!(pending_messages.is_empty());
     }
 }
 
@@ -1861,6 +2173,7 @@ impl<S: GossipMessageStore + Send + Sync + 'static, C: CkbChainClient + Send + S
                 n_queries,
                 peer,
                 is_success,
+                missing_channel_announcements,
             }) => {
                 trace!(
                     n_queries = n_queries,
@@ -1868,6 +2181,7 @@ impl<S: GossipMessageStore + Send + Sync + 'static, C: CkbChainClient + Send + S
                     is_success = is_success,
                     "Querying task done"
                 );
+                state.cache_missing_channel_announcements(missing_channel_announcements);
                 state.num_query_tasks_running -= 1;
             }
 
@@ -1875,7 +2189,7 @@ impl<S: GossipMessageStore + Send + Sync + 'static, C: CkbChainClient + Send + S
                 trace!(
                     "Gossip store maintenance ticked: #subscriptions = {},  #messages_to_be_saved = {}",
                     state.output_ports.len(),
-                    state.messages_to_be_saved.values().map(|s| s.len()).sum::<usize>(),
+                    state.messages_to_be_saved_count,
                 );
 
                 // These are the messages that have complete dependencies and can be sent to the subscribers.
@@ -1892,6 +2206,7 @@ pub struct QueryResult {
     n_queries: usize,
     peer: Pubkey,
     is_success: bool,
+    missing_channel_announcements: Vec<OutPoint>,
 }
 
 #[derive(AsRefStr)]
